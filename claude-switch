@@ -14,7 +14,11 @@ Usage:
   claude-switch remove NAME     forget a saved account
   claude-switch restart         restart OpenClaw on the current account
   claude-switch usage           show each account's 5-hour usage left
+  claude-switch auto [on|off]   show or set auto-switching when a limit is reached
+  claude-switch auto check      auto-switch now if the active account is out
 """
+import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -31,6 +35,10 @@ CREDS = CLAUDE_DIR / ".credentials.json"
 GLOBAL_JSON = HOME / ".claude.json"
 STORE = HOME / ".claude-accounts"
 ACTIVE = STORE / "active"
+AUTO_FILE = STORE / "autoswitch"
+LOCK = STORE / "switch.lock"
+AUTO_OUT = 2        # the active lemon counts as out below this % left
+AUTO_MIN_LEFT = 10  # only switch to a lemon with at least this % left
 GATEWAY_UNIT = "openclaw-gateway.service"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
@@ -137,6 +145,73 @@ def usage_of(name):
     return {**u, "stale": True}
 
 
+def auto_enabled():
+    try:
+        return AUTO_FILE.read_text().strip() == "on"
+    except FileNotFoundError:
+        return False
+
+
+def set_auto(on):
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    AUTO_FILE.write_text("on" if on else "off")
+
+
+def auto_pick(usages):
+    """Which lemon to switch to, given {name: usage_of(name)}, or None.
+
+    Only switches when the active lemon's fresh reading says it's out, and only
+    to the lemon with the most left, if that's at least AUTO_MIN_LEFT.
+    """
+    cur = active()
+    u = usages.get(cur)
+    if not cur or not u or u["stale"] or 100 - u["used"] >= AUTO_OUT:
+        return None
+    left = [(100 - v["used"], n) for n, v in usages.items() if n != cur and v]
+    best = max(left, default=None)
+    return best[1] if best and best[0] >= AUTO_MIN_LEFT else None
+
+
+@contextlib.contextmanager
+def switch_lock(wait=True):
+    """Only one switch at a time, across the window, the timer and the terminal.
+
+    Yields False instead of waiting when wait=False and someone else holds it.
+    """
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    with open(LOCK, "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def notify(text):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-i", "system-users", "Lemon Switcher", text],
+                       capture_output=True)
+
+
+def auto_switch(usages):
+    """Switch away from the active lemon if it's out. Returns (old, new) or None.
+
+    Picks again under the lock, so if the window and the timer both notice at
+    once, the second one sees the new active lemon and leaves it alone.
+    """
+    with switch_lock(wait=False) as got:
+        if not got:
+            return None
+        old, pick = active(), auto_pick(usages)
+        if not pick:
+            return None
+        print(f"'{old}' has reached its limit.")
+        _use(pick)
+    notify(f"{old} reached its 5-hour limit, so we switched to {pick}.")
+    return old, pick
+
+
 def save_current(name):
     """Copy the live login into profile NAME."""
     creds = read_json(CREDS)
@@ -223,6 +298,21 @@ def cmd_usage():
         print(f"   {n:<12} [{bar:<20}] {left:3.0f}% left{when}{note}")
 
 
+def cmd_auto(arg=None):
+    if arg in ("on", "off"):
+        set_auto(arg == "on")
+    elif arg == "check":
+        if not auto_enabled():
+            print("Auto-switch is off.")
+            return
+        if not auto_switch({n: usage_of(n) for n in profiles()}):
+            print("No switch needed.")
+        return
+    elif arg is not None:
+        die("use: claude-switch auto [on|off|check]")
+    print(f"Auto-switch is {'on' if auto_enabled() else 'off'}.")
+
+
 def cmd_list():
     cur = active()
     names = profiles()
@@ -248,6 +338,11 @@ def cmd_restart():
 
 
 def cmd_use(name):
+    with switch_lock():
+        _use(name)
+
+
+def _use(name):
     name = valid_name(name)
     if name not in profiles():
         die(f"no saved account '{name}' (see: claude-switch list)")
@@ -343,6 +438,8 @@ def main():
         cmd_restart()
     elif cmd == "usage":
         cmd_usage()
+    elif cmd == "auto" and len(rest) <= 1:
+        cmd_auto(*rest)
     elif cmd in one_arg and len(rest) == 1:
         one_arg[cmd](rest[0])
     else:

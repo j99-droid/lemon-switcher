@@ -47,6 +47,7 @@ progressbar progress { min-height: 10px; border-radius: 6px; border: none; backg
 progressbar.low progress { background: #f2b200; }
 progressbar.out progress { background: #e5533d; }
 progressbar.stale progress { opacity: .5; }
+.auto { color: #5c4a00; font-weight: 600; }
 """
 
 
@@ -249,6 +250,15 @@ class LemonSwitcher(Gtk.Window):
         srow.pack_start(self.status, False, False, 0)
         outer.pack_start(srow, False, False, 0)
 
+        arow = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER)
+        alabel = Gtk.Label(label="Switch lemons automatically when one runs out")
+        alabel.get_style_context().add_class("auto")
+        self.auto = Gtk.Switch(active=cs.auto_enabled(), valign=Gtk.Align.CENTER)
+        self.auto.connect("notify::active", self.on_auto_toggled)
+        arow.pack_start(alabel, False, False, 0)
+        arow.pack_start(self.auto, False, False, 0)
+        outer.pack_start(arow, False, False, 0)
+
         hint = Gtk.Label(label="Right-click a lemon to forget that account.")
         hint.get_style_context().add_class("subtitle")
         outer.pack_start(hint, False, False, 0)
@@ -289,10 +299,36 @@ class LemonSwitcher(Gtk.Window):
             self._usage_running = False
             for c in self.cards:
                 c.set_usage(results.get(c.slot))
+            self.maybe_auto_switch(results)
             return False
 
         threading.Thread(target=worker, daemon=True).start()
         return True
+
+    def on_auto_toggled(self, switch, _param):
+        cs.set_auto(switch.get_active())
+        if switch.get_active():
+            self.say("Auto-switch is on.")
+            self.check_usage()
+        else:
+            self.say("Auto-switch is off.")
+
+    def maybe_auto_switch(self, results):
+        if self.busy or not self.auto.get_active():
+            return
+        if not cs.auto_pick(results):
+            return
+        done = {}
+        labels = dict(SLOTS)
+
+        def done_text():
+            if not done.get("r"):
+                return ""  # the timer got there first
+            old, new = (labels.get(n, n) for n in done["r"])
+            return f"{old} reached its limit, so we switched to {new}. Reopen any Claude windows."
+
+        self.run_in_background(lambda: done.update(r=cs.auto_switch(results)),
+                               "Your lemon is out. Switching…", done_text)
 
     def say(self, text, spinning=False):
         self.status.set_text(text)
@@ -324,7 +360,7 @@ class LemonSwitcher(Gtk.Window):
                 self.say("")
                 self.error(err)
             else:
-                self.say(done_text)
+                self.say(done_text() if callable(done_text) else done_text)
             return False
 
         threading.Thread(target=worker, daemon=True).start()

@@ -45,6 +45,13 @@ This puts `lemon-switcher` and `claude-switch` in `~/.local/bin` and adds
   limit is left, and when it resets. It updates every minute. A faded bar is
   the last known reading: a saved login's token expires a few hours after that
   person last used it, and the switcher won't refresh it for them.
+- **Auto-switch** (the toggle under the lemons): when the lemon in use has less
+  than 2% of its 5-hour limit left, the switcher moves to the lemon with the
+  most left (if that's at least 10%) and shows a notification. The window
+  checks every minute while it's open, and a background timer
+  (`lemon-autoswitch.timer`, added by `install.sh`) checks every 3 minutes
+  even when it's closed. Turn it off with the toggle or
+  `claude-switch auto off`.
 
 Wait until OpenClaw's agents are idle before switching: the restart stops
 anything that's running. Afterwards, close and reopen any Claude Code windows.
@@ -60,6 +67,8 @@ claude-switch use NAME        switch to NAME
 claude-switch remove NAME     forget a saved account
 claude-switch restart         restart OpenClaw on the current account
 claude-switch usage           show each account's 5-hour usage left
+claude-switch auto [on|off]   show or set auto-switching when a limit is reached
+claude-switch auto check      auto-switch now if the active account is out
 ```
 
 ## Fair use
