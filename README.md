@@ -41,6 +41,10 @@ This puts `lemon-switcher` and `claude-switch` in `~/.local/bin` and adds
 - **Sleepy lemon**: a saved account. Click it to switch.
 - **Happy lemon**: the account in use right now.
 - **Right-click** a lemon to forget that account.
+- The **bar** under each lemon shows how much of that person's 5-hour usage
+  limit is left, and when it resets. It updates every minute. A faded bar is
+  the last known reading: a saved login's token expires a few hours after that
+  person last used it, and the switcher won't refresh it for them.
 
 Wait until OpenClaw's agents are idle before switching: the restart stops
 anything that's running. Afterwards, close and reopen any Claude Code windows.
@@ -55,6 +59,7 @@ claude-switch save NAME       save whoever is signed in right now as NAME
 claude-switch use NAME        switch to NAME
 claude-switch remove NAME     forget a saved account
 claude-switch restart         restart OpenClaw on the current account
+claude-switch usage           show each account's 5-hour usage left
 ```
 
 ## Fair use

@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -40,6 +41,12 @@ window { background: #fffbea; }
 .badge.idle { background: #efe6c0; color: #7a6d3a; }
 .badge.empty { background: transparent; color: #a99a5a; border: 1px dashed #c9b97a; }
 .status { color: #5c4a00; font-weight: 600; }
+.usage { color: #7a6d3a; font-size: 11px; }
+progressbar trough { min-height: 10px; border-radius: 6px; background: #f1ead0; border: none; }
+progressbar progress { min-height: 10px; border-radius: 6px; border: none; background: #4cb050; }
+progressbar.low progress { background: #f2b200; }
+progressbar.out progress { background: #e5533d; }
+progressbar.stale progress { opacity: .5; }
 """
 
 
@@ -120,7 +127,16 @@ class LemonCard(Gtk.EventBox):
         self.badge.get_style_context().add_class("badge")
         self.badge.set_halign(Gtk.Align.CENTER)
 
-        for wdg in (self.art, self.name, self.email, self.badge):
+        self.bar = Gtk.ProgressBar()
+        self.bar.set_margin_start(8)
+        self.bar.set_margin_end(8)
+        self.bar.set_margin_top(4)
+        self.usage = Gtk.Label()
+        self.usage.get_style_context().add_class("usage")
+        self.bar.set_no_show_all(True)
+        self.usage.set_no_show_all(True)
+
+        for wdg in (self.art, self.name, self.email, self.badge, self.bar, self.usage):
             box.pack_start(wdg, False, False, 0)
         self.add(box)
 
@@ -157,6 +173,37 @@ class LemonCard(Gtk.EventBox):
             self.badge.set_text("Click to switch")
             bctx.add_class("idle")
         self.art.set_from_pixbuf(lemon_pixbuf(self.state))
+        if self.state == "empty":
+            self.bar.hide()
+            self.usage.hide()
+
+    def set_usage(self, u):
+        """Show 5-hour usage left. u comes from cs.usage_of (None = unknown)."""
+        if self.state == "empty":
+            return
+        ctx = self.bar.get_style_context()
+        for c in ("low", "out", "stale"):
+            ctx.remove_class(c)
+        if not u:
+            self.bar.set_fraction(0)
+            self.usage.set_text("5-hour usage: unknown")
+        else:
+            left = max(0.0, min(100.0, 100 - u["used"]))
+            self.bar.set_fraction(left / 100)
+            if left < 10:
+                ctx.add_class("out")
+            elif left < 30:
+                ctx.add_class("low")
+            text = f"{left:.0f}% of 5-hour limit left"
+            if u.get("resets_at") and left < 100:
+                text += f"\nresets at {time.strftime('%-I:%M %p', time.localtime(u['resets_at']))}"
+            if u["stale"]:
+                ctx.add_class("stale")
+                text += f"\n(last checked {time.strftime('%-I:%M %p', time.localtime(u['checked']))})"
+            self.usage.set_text(text)
+        self.usage.set_justify(Gtk.Justification.CENTER)
+        self.bar.show()
+        self.usage.show()
 
     def on_click(self, _w, event):
         if self.app.busy:
@@ -210,12 +257,41 @@ class LemonSwitcher(Gtk.Window):
         self.refresh()
         # Pick up sign-ins finished in the terminal window.
         GLib.timeout_add_seconds(2, self.refresh)
+        self._usage_running = False
+        self.check_usage()
+        GLib.timeout_add_seconds(60, self.check_usage)
 
     def refresh(self):
         if not self.busy:
             saved, active = cs.profiles(), cs.active()
             for c in self.cards:
                 c.refresh(saved, active)
+        return True
+
+    def check_usage(self):
+        """Look up each lemon's 5-hour usage in the background."""
+        if self._usage_running:
+            return True
+        self._usage_running = True
+        slots = [c.slot for c in self.cards]
+
+        def worker():
+            saved = set(cs.profiles())
+            results = {}
+            for slot in slots:
+                try:
+                    results[slot] = cs.usage_of(slot) if slot in saved else None
+                except Exception:  # noqa: BLE001 - never let a lookup crash the window
+                    results[slot] = None
+            GLib.idle_add(show, results)
+
+        def show(results):
+            self._usage_running = False
+            for c in self.cards:
+                c.set_usage(results.get(c.slot))
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
         return True
 
     def say(self, text, spinning=False):
@@ -243,6 +319,7 @@ class LemonSwitcher(Gtk.Window):
         def finish(err):
             self.busy = False
             self.refresh()
+            self.check_usage()
             if err:
                 self.say("")
                 self.error(err)
