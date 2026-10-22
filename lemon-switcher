@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Lemon Switcher: click a lemon to switch the Claude Code / OpenClaw account.
+
+A friendly window on top of `claude-switch`, which must sit in the same folder.
+"""
+import os
+import shlex
+import shutil
+import subprocess
+import threading
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+SWITCH = HERE / "claude-switch"
+cs = SourceFileLoader("claude_switch", str(SWITCH)).load_module()
+
+SLOTS = [("lemon1", "Lemon 1"), ("lemon2", "Lemon 2"), ("lemon3", "Lemon 3")]
+SIZE = 170
+
+CSS = b"""
+window { background: #fffbea; }
+.title { font-size: 22px; font-weight: 800; color: #5c4a00; }
+.subtitle { color: #8a7a3a; }
+.card { background: #ffffff; border-radius: 22px; padding: 14px 10px 16px 10px;
+        border: 3px solid #f3e7b3; }
+.card.active { border-color: #4cb050; background: #f3fbf1; }
+.card.hover { border-color: #f2c200; }
+.name { font-size: 18px; font-weight: 800; color: #3d3200; }
+.email { color: #7a6d3a; font-size: 12px; }
+.badge { background: #4cb050; color: white; border-radius: 10px; padding: 2px 10px;
+         font-weight: 700; font-size: 12px; }
+.badge.idle { background: #efe6c0; color: #7a6d3a; }
+.badge.empty { background: transparent; color: #a99a5a; border: 1px dashed #c9b97a; }
+.status { color: #5c4a00; font-weight: 600; }
+"""
+
+
+LEMON = (
+    "M12 84 Q18 76 26 72 C34 48 62 42 85 42 C108 42 136 48 144 72 Q152 76 158 84 "
+    "Q152 92 144 96 C136 120 108 126 85 126 C62 126 34 120 26 96 Q18 92 12 84 Z"
+)
+
+FACES = {
+    "active": """
+      <circle cx="68" cy="80" r="6.5" fill="#3d3000"/><circle cx="102" cy="80" r="6.5" fill="#3d3000"/>
+      <circle cx="70.5" cy="77.5" r="2.2" fill="#fff"/><circle cx="104.5" cy="77.5" r="2.2" fill="#fff"/>
+      <path d="M66 96 Q85 116 104 96" fill="none" stroke="#3d3000" stroke-width="4" stroke-linecap="round"/>
+      <ellipse cx="54" cy="96" rx="9" ry="6" fill="#ff7a6b" opacity=".45"/>
+      <ellipse cx="116" cy="96" rx="9" ry="6" fill="#ff7a6b" opacity=".45"/>""",
+    "idle": """
+      <path d="M60 79 Q68 87 76 79 M94 79 Q102 87 110 79" fill="none" stroke="#3d3000"
+            stroke-width="3.5" stroke-linecap="round"/>
+      <path d="M77 101 Q85 107 93 101" fill="none" stroke="#3d3000" stroke-width="3.5" stroke-linecap="round"/>""",
+    "empty": """
+      <path d="M85 68 V100 M69 84 H101" stroke="#a09c8c" stroke-width="7" stroke-linecap="round"/>""",
+}
+
+
+def lemon_svg(state):
+    fill, edge = {
+        "active": ("#ffd726", "#d99e00"),
+        "idle": ("#ffe680", "#d6b640"),
+        "empty": ("#efede4", "#b8b39f"),
+    }[state]
+    dash = ' stroke-dasharray="8 6"' if state == "empty" else ""
+    extras = "" if state == "empty" else f"""
+      <ellipse cx="112" cy="38" rx="17" ry="7" fill="#55ad45" transform="rotate(-35 112 38)"/>
+      <path d="M85 42 Q92 34 100 36" fill="none" stroke="#3f8a33" stroke-width="3" stroke-linecap="round"/>"""
+    shine = "" if state == "empty" else \
+        '<ellipse cx="50" cy="66" rx="13" ry="5" fill="#fff" opacity=".6" transform="rotate(-30 50 66)"/>'
+    zzz = "" if state != "idle" else """
+      <text x="138" y="40" font-family="sans-serif" font-weight="bold" font-size="14" fill="#8a7a3a">z</text>
+      <text x="150" y="26" font-family="sans-serif" font-weight="bold" font-size="18" fill="#8a7a3a">z</text>"""
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{SIZE}" height="150" viewBox="0 0 170 150">
+      <g transform="rotate(-10 85 84)">{extras}
+        <path d="{LEMON}" fill="{fill}" stroke="{edge}" stroke-width="3.5"{dash}/>
+        {shine}{FACES[state]}
+      </g>{zzz}</svg>"""
+
+
+_pixbufs = {}
+
+
+def lemon_pixbuf(state):
+    if state not in _pixbufs:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(lemon_svg(state).encode())
+        loader.close()
+        _pixbufs[state] = loader.get_pixbuf()
+    return _pixbufs[state]
+
+
+class LemonCard(Gtk.EventBox):
+    def __init__(self, app, slot, label):
+        super().__init__()
+        self.app, self.slot, self.label = app, slot, label
+        self.state = "empty"
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.get_style_context().add_class("card")
+        self.box = box
+
+        self.art = Gtk.Image.new_from_pixbuf(lemon_pixbuf("empty"))
+
+        self.name = Gtk.Label(label=label)
+        self.name.get_style_context().add_class("name")
+        self.email = Gtk.Label()
+        self.email.get_style_context().add_class("email")
+        self.email.set_ellipsize(3)
+        self.email.set_max_width_chars(22)
+        self.badge = Gtk.Label()
+        self.badge.get_style_context().add_class("badge")
+        self.badge.set_halign(Gtk.Align.CENTER)
+
+        for wdg in (self.art, self.name, self.email, self.badge):
+            box.pack_start(wdg, False, False, 0)
+        self.add(box)
+
+        self.connect("button-press-event", self.on_click)
+        self.connect("enter-notify-event", lambda *a: self.hover(True))
+        self.connect("leave-notify-event", lambda *a: self.hover(False))
+        self.connect("realize", lambda *a: self.get_window().set_cursor(
+            Gdk.Cursor.new_from_name(self.get_display(), "pointer")))
+
+    def hover(self, on):
+        ctx = self.box.get_style_context()
+        (ctx.add_class if on else ctx.remove_class)("hover")
+
+    def refresh(self, saved, active):
+        ctx = self.box.get_style_context()
+        bctx = self.badge.get_style_context()
+        for c in ("active",):
+            ctx.remove_class(c)
+        for c in ("idle", "empty"):
+            bctx.remove_class(c)
+        if self.slot not in saved:
+            self.state = "empty"
+            self.email.set_text("Not set up yet")
+            self.badge.set_text("Click to sign in")
+            bctx.add_class("empty")
+        elif self.slot == active:
+            self.state = "active"
+            self.email.set_text(cs.email_of(self.slot))
+            self.badge.set_text("Using now")
+            ctx.add_class("active")
+        else:
+            self.state = "idle"
+            self.email.set_text(cs.email_of(self.slot))
+            self.badge.set_text("Click to switch")
+            bctx.add_class("idle")
+        self.art.set_from_pixbuf(lemon_pixbuf(self.state))
+
+    def on_click(self, _w, event):
+        if self.app.busy:
+            return
+        if event.button == 3 and self.state != "empty":
+            self.app.offer_forget(self)
+        elif event.button == 1:
+            self.app.activate_slot(self)
+
+
+class LemonSwitcher(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Lemon Switcher")
+        self.busy = False
+        self.set_resizable(False)
+        self.set_border_width(24)
+        self.set_icon_name("system-users")
+
+        style = Gtk.CssProvider()
+        style.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), style, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        title = Gtk.Label(label="Who's using Claude?")
+        title.get_style_context().add_class("title")
+        sub = Gtk.Label(label="Click a lemon to switch. OpenClaw follows along.")
+        sub.get_style_context().add_class("subtitle")
+        outer.pack_start(title, False, False, 0)
+        outer.pack_start(sub, False, False, 0)
+
+        row = Gtk.Box(spacing=16, homogeneous=True)
+        self.cards = [LemonCard(self, slot, label) for slot, label in SLOTS]
+        for c in self.cards:
+            row.pack_start(c, True, True, 0)
+        outer.pack_start(row, False, False, 6)
+
+        self.spinner = Gtk.Spinner()
+        self.status = Gtk.Label()
+        self.status.get_style_context().add_class("status")
+        srow = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        srow.pack_start(self.spinner, False, False, 0)
+        srow.pack_start(self.status, False, False, 0)
+        outer.pack_start(srow, False, False, 0)
+
+        hint = Gtk.Label(label="Right-click a lemon to forget that account.")
+        hint.get_style_context().add_class("subtitle")
+        outer.pack_start(hint, False, False, 0)
+
+        self.add(outer)
+        self.refresh()
+        # Pick up sign-ins finished in the terminal window.
+        GLib.timeout_add_seconds(2, self.refresh)
+
+    def refresh(self):
+        if not self.busy:
+            saved, active = cs.profiles(), cs.active()
+            for c in self.cards:
+                c.refresh(saved, active)
+        return True
+
+    def say(self, text, spinning=False):
+        self.status.set_text(text)
+        (self.spinner.start if spinning else self.spinner.stop)()
+
+    def error(self, text):
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
+                              buttons=Gtk.ButtonsType.OK, text="Something went wrong")
+        d.format_secondary_text(text)
+        d.run()
+        d.destroy()
+
+    def run_in_background(self, work, busy_text, done_text):
+        self.busy = True
+        self.say(busy_text, spinning=True)
+
+        def worker():
+            try:
+                work()
+                GLib.idle_add(finish, None)
+            except Exception as e:  # noqa: BLE001 - show anything to the user
+                GLib.idle_add(finish, str(e))
+
+        def finish(err):
+            self.busy = False
+            self.refresh()
+            if err:
+                self.say("")
+                self.error(err)
+            else:
+                self.say(done_text)
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def activate_slot(self, card):
+        if card.state == "active":
+            self.say(f"{card.label} is already signed in.")
+            return
+        if card.state == "idle":
+            self.run_in_background(
+                lambda: cs.cmd_use(card.slot),
+                f"Switching to {card.label}…",
+                f"{card.label} is in! Reopen any Claude windows.")
+            return
+        self.set_up(card)
+
+    def set_up(self, card):
+        live = (cs.read_json(cs.GLOBAL_JSON) or {}).get("oauthAccount", {}).get("emailAddress")
+        taken = {cs.email_of(p) for p in cs.profiles()}
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.QUESTION,
+                              text=f"Set up {card.label}")
+        if live and live not in taken and cs.read_json(cs.CREDS):
+            d.format_secondary_text(
+                f"{live} is signed in right now. Use that account for {card.label}, "
+                "or sign in someone else?")
+            d.add_button("Sign in someone else", 2)
+            d.add_button(f"Use {live}", 1)
+            d.set_default_response(1)
+        else:
+            d.format_secondary_text(
+                "A terminal will open with Claude Code. Type /login, sign in with "
+                "your own account in the browser, then type /exit.")
+            d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            d.add_button("Open sign-in", 2)
+            d.set_default_response(2)
+        resp = d.run()
+        d.destroy()
+        if resp == 1:
+            self.run_in_background(
+                lambda: cs.cmd_save(card.slot),
+                f"Saving {card.label}…",
+                f"{card.label} saved and in use!")
+        elif resp == 2:
+            self.open_terminal_login(card)
+
+    def open_terminal_login(self, card):
+        cmd = f"{shlex.quote(str(SWITCH))} add {card.slot}; echo; read -p 'Press Enter to close…'"
+        term = os.environ.get("TERMINAL") or next(
+            (t for t in ("x-terminal-emulator", "cosmic-term", "gnome-terminal", "konsole", "xterm")
+             if shutil.which(t)), None)
+        if not term:
+            self.error("Couldn't find a terminal app. Run this yourself:\n\n"
+                       f"claude-switch add {card.slot}")
+            return
+        args = [term, "--", "bash", "-c", cmd] if term == "gnome-terminal" else [term, "-e", "bash", "-c", cmd]
+        subprocess.Popen(args)
+        self.say(f"Finish signing in {card.label} in the terminal window…")
+
+    def offer_forget(self, card):
+        if card.state == "active":
+            self.say("Switch to another lemon before forgetting this one.")
+            return
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.WARNING,
+                              buttons=Gtk.ButtonsType.OK_CANCEL,
+                              text=f"Forget {card.label}?")
+        d.format_secondary_text(
+            f"{cs.email_of(card.slot)} will be removed from this computer. "
+            "They can sign in again any time.")
+        resp = d.run()
+        d.destroy()
+        if resp == Gtk.ResponseType.OK:
+            try:
+                cs.cmd_remove(card.slot)
+            except cs.SwitchError as e:
+                self.error(str(e))
+            self.refresh()
+            self.say(f"Forgot {card.label}.")
+
+
+if __name__ == "__main__":
+    win = LemonSwitcher()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()

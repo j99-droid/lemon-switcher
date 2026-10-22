@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""claude-switch: swap which Claude Code account this machine (and OpenClaw) uses.
+
+OpenClaw runs Claude through the `claude` CLI (agentRuntime "claude-cli"), so it
+always uses whatever account Claude Code is logged into. Switching the Claude
+Code login and restarting the OpenClaw gateway switches both.
+
+Usage:
+  claude-switch                 interactive menu
+  claude-switch list            show saved accounts (* = active)
+  claude-switch add NAME        log a new person in and save them as NAME
+  claude-switch save NAME       save whoever is logged in right now as NAME
+  claude-switch use NAME        switch to NAME
+  claude-switch remove NAME     forget a saved account
+  claude-switch restart         restart OpenClaw on the current account
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
+CREDS = CLAUDE_DIR / ".credentials.json"
+GLOBAL_JSON = HOME / ".claude.json"
+STORE = HOME / ".claude-accounts"
+ACTIVE = STORE / "active"
+GATEWAY_UNIT = "openclaw-gateway.service"
+
+# Apps started from the desktop menu don't get ~/.local/bin on PATH, which is
+# where the claude installer puts `claude`.
+_local_bin = str(HOME / ".local" / "bin")
+if _local_bin not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _local_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+class SwitchError(Exception):
+    pass
+
+
+def die(msg):
+    raise SwitchError(msg)
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+
+
+def write_json(path, data):
+    # Write to a temp file and rename, so a crash never leaves half a file.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".switch-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def valid_name(name):
+    if not name or not name.replace("-", "").replace("_", "").isalnum():
+        die("names can only use letters, numbers, - and _")
+    return name.lower()
+
+
+def profiles():
+    if not STORE.exists():
+        return []
+    return sorted(p.name for p in STORE.iterdir() if (p / "credentials.json").exists())
+
+
+def active():
+    try:
+        return ACTIVE.read_text().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def set_active(name):
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    ACTIVE.write_text(name or "")
+
+
+def email_of(name):
+    acct = read_json(STORE / name / "account.json") or {}
+    return acct.get("emailAddress", "?")
+
+
+def save_current(name):
+    """Copy the live login into profile NAME."""
+    creds = read_json(CREDS)
+    if not creds or "claudeAiOauth" not in creds:
+        die("nobody is logged into Claude Code right now")
+    acct = (read_json(GLOBAL_JSON) or {}).get("oauthAccount", {})
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    (STORE / name).mkdir(mode=0o700, exist_ok=True)
+    write_json(STORE / name / "credentials.json", creds)
+    write_json(STORE / name / "account.json", acct)
+    return acct.get("emailAddress", "?")
+
+
+def sync_active():
+    """Claude refreshes tokens as it runs, so save the live copy back first."""
+    cur = active()
+    if cur and cur in profiles() and read_json(CREDS):
+        save_current(cur)
+
+
+def load_profile(name):
+    creds = read_json(STORE / name / "credentials.json")
+    acct = read_json(STORE / name / "account.json") or {}
+    write_json(CREDS, creds)
+    g = read_json(GLOBAL_JSON) or {}
+    if acct:
+        g["oauthAccount"] = acct
+    else:
+        g.pop("oauthAccount", None)
+    write_json(GLOBAL_JSON, g)
+
+
+def clear_login():
+    if CREDS.exists():
+        CREDS.unlink()
+    g = read_json(GLOBAL_JSON)
+    if g and "oauthAccount" in g:
+        g.pop("oauthAccount")
+        write_json(GLOBAL_JSON, g)
+
+
+def restart_gateway():
+    if os.environ.get("CLAUDE_SWITCH_NO_RESTART"):
+        return
+    if shutil.which("systemctl") is None:
+        return
+    found = subprocess.run(
+        ["systemctl", "--user", "cat", GATEWAY_UNIT],
+        capture_output=True,
+    ).returncode == 0
+    if not found:
+        return
+    print("Restarting OpenClaw so it picks up the new account...")
+    r = subprocess.run(["systemctl", "--user", "restart", GATEWAY_UNIT])
+    if r.returncode != 0:
+        print(f"warning: could not restart {GATEWAY_UNIT}; restart OpenClaw yourself")
+
+
+def gateway_stale():
+    """True if OpenClaw started before the current login was written."""
+    r = subprocess.run(
+        ["systemctl", "--user", "show", GATEWAY_UNIT, "-p", "ActiveEnterTimestampMonotonic", "--value"],
+        capture_output=True, text=True,
+    )
+    started_us = int(r.stdout.strip() or 0) if r.returncode == 0 else 0
+    if not started_us or not CREDS.exists():
+        return False
+    # Compare against the monotonic clock: how long ago each thing happened.
+    started_ago = time.monotonic() - started_us / 1e6
+    login_ago = time.time() - CREDS.stat().st_mtime
+    return login_ago < started_ago
+
+
+def cmd_list():
+    cur = active()
+    names = profiles()
+    if not names:
+        print("No saved accounts yet. Open Lemon Switcher, or run:  claude-switch save lemon1")
+        return
+    for n in names:
+        mark = "*" if n == cur else " "
+        print(f" {mark} {n:<12} {email_of(n)}")
+
+
+def cmd_save(name):
+    name = valid_name(name)
+    email = save_current(name)
+    set_active(name)
+    print(f"Saved the current login ({email}) as '{name}'.")
+    if shutil.which("systemctl") and gateway_stale():
+        restart_gateway()
+
+
+def cmd_restart():
+    restart_gateway()
+
+
+def cmd_use(name):
+    name = valid_name(name)
+    if name not in profiles():
+        die(f"no saved account '{name}' (see: claude-switch list)")
+    if name == active():
+        print(f"'{name}' is already active.")
+        return
+    sync_active()
+    load_profile(name)
+    set_active(name)
+    print(f"Switched to '{name}' ({email_of(name)}).")
+    restart_gateway()
+    print("Close and reopen any open Claude Code windows so they use the new account.")
+
+
+def cmd_add(name):
+    name = valid_name(name)
+    if name in profiles():
+        die(f"'{name}' already exists; use 'claude-switch use {name}'")
+    if shutil.which("claude") is None:
+        die("the 'claude' command isn't installed or isn't on PATH")
+    sync_active()
+    previous = active()
+    clear_login()
+    set_active(None)
+    print(f"\nClaude Code will open now. {name}: type /login, sign in with")
+    print("YOUR account in the browser, then type /exit to come back here.\n")
+    input("Press Enter to continue...")
+    subprocess.run(["claude"])
+    if not read_json(CREDS):
+        print("No login happened.")
+        if previous:
+            load_profile(previous)
+            set_active(previous)
+            print(f"Put '{previous}' back.")
+        return
+    email = save_current(name)
+    set_active(name)
+    print(f"Saved {email} as '{name}' and switched to it.")
+    restart_gateway()
+
+
+def cmd_remove(name):
+    name = valid_name(name)
+    if name not in profiles():
+        die(f"no saved account '{name}'")
+    if name == active():
+        die("that account is active; switch to someone else first")
+    shutil.rmtree(STORE / name)
+    print(f"Removed '{name}'.")
+
+
+def menu():
+    while True:
+        names = profiles()
+        cur = active()
+        print("\n=== Claude account switcher ===")
+        print(f"Active: {cur or '(none saved)'}\n")
+        for i, n in enumerate(names, 1):
+            mark = " <- active" if n == cur else ""
+            print(f"  {i}. {n}  ({email_of(n)}){mark}")
+        print("\n  a. add a person   s. save current login   r. remove   q. quit")
+        choice = input("> ").strip().lower()
+        if choice == "q" or choice == "":
+            return
+        try:
+            menu_action(choice, names)
+        except SwitchError as e:
+            print(f"error: {e}")
+
+
+def menu_action(choice, names):
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        cmd_use(names[int(choice) - 1])
+    elif choice == "a":
+        cmd_add(input("Name for the new person: ").strip())
+    elif choice == "s":
+        cmd_save(input("Save current login as: ").strip())
+    elif choice == "r":
+        cmd_remove(input("Name to remove: ").strip())
+    else:
+        print("?")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        return menu()
+    cmd, rest = args[0], args[1:]
+    one_arg = {"save": cmd_save, "use": cmd_use, "add": cmd_add, "remove": cmd_remove}
+    if cmd == "list":
+        cmd_list()
+    elif cmd == "restart":
+        cmd_restart()
+    elif cmd in one_arg and len(rest) == 1:
+        one_arg[cmd](rest[0])
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SwitchError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except (KeyboardInterrupt, EOFError):
+        print()
