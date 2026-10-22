@@ -259,7 +259,12 @@ class LemonSwitcher(Gtk.Window):
         arow.pack_start(self.auto, False, False, 0)
         outer.pack_start(arow, False, False, 0)
 
-        hint = Gtk.Label(label="Right-click a lemon to forget that account.")
+        self.refresh_usage_btn = Gtk.Button(label="Refresh usage")
+        self.refresh_usage_btn.set_halign(Gtk.Align.CENTER)
+        self.refresh_usage_btn.connect("clicked", lambda *a: self.check_usage())
+        outer.pack_start(self.refresh_usage_btn, False, False, 0)
+
+        hint =Gtk.Label(label="Right-click a lemon to forget that account.")
         hint.get_style_context().add_class("subtitle")
         outer.pack_start(hint, False, False, 0)
 
@@ -269,7 +274,6 @@ class LemonSwitcher(Gtk.Window):
         GLib.timeout_add_seconds(2, self.refresh)
         self._usage_running = False
         self.check_usage()
-        GLib.timeout_add_seconds(60, self.check_usage)
 
     def refresh(self):
         if not self.busy:
